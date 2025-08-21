@@ -1,0 +1,521 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Complete WordPress hosting infrastructure with load balancer, auto-scaling, database, file storage, and monitoring.
+Author: 84fresva
+
+Parameters:
+
+  Environment:
+    Description: Environment tag for all resources (dev, staging, prod).
+    Type: String
+    Default: dev
+
+  InstanceType:
+    Description: EC2 server type.
+    Type: String
+    Default: t3.micro
+
+  MinInstances:
+    Description: Minimum number of EC2 instances to keep running.
+    Type: Number
+    Default: 1
+    MinValue: 1
+
+  MaxInstances:
+    Description: Maximum number of EC2 instances during high traffic.
+    Type: Number
+    Default: 5
+    MaxValue: 10
+
+  DesiredInstances:
+    Description: Normal number of EC2 instances to run.
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+
+
+Resources:
+
+  # Security & Secrets
+
+  DatabaseSecret:
+    Description: Secure storage (WordPress database username and password).
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub wordpress-db-secret-${Environment}-${AWS::StackName}
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "wpuser"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 20
+        ExcludeCharacters: '"@/\^`~(){}[]|;:,.<>?*&#%$!'
+        RequireEachIncludedType: true
+        IncludeSpace: false
+
+
+  # Network & Connectivity
+
+  VPC:
+    Description: Private network cloud for all resources.
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub wp-vpc-${Environment}
+
+  InternetGateway:
+    Description: Gateway connecting private network to the internet.
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub wp-igw-${Environment}
+
+  AttachGateway:
+    Description: Links internet gateway to the private network.
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Description: Traffic routing rules for public internet access.
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub wp-rt-${Environment}
+
+  PublicRoute:
+    Description: Route directing all traffic to internet gateway.
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Description: First availability zone subnet for high availability.
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub wp-subnet-a-${Environment}
+
+  PublicSubnetB:
+    Description: Second availability zone subnet for high availability.
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub wp-subnet-b-${Environment}
+
+  SubnetAssociationA:
+    Description: Connects first subnet to routing table.
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref RouteTable
+
+  SubnetAssociationB:
+    Description: Connects second subnet to routing table.
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref RouteTable
+
+
+  # Firewall Rules
+
+  ALBSecurityGroup:
+    Description: Firewall rules allowing web traffic to load balancer.
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroup:
+    Description: Firewall rules for WordPress servers (HTTP from load balancer only).
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  EFSSecurityGroup:
+    Description: Firewall rules allowing WordPress servers to access shared file storage.
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS traffic from EC2
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+
+  RDSSecurityGroup:
+    Description: Firewall rules allowing WordPress servers to access database.
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL traffic from EC2
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+
+  S3Bucket:
+    Description: Cloud storage bucket for WordPress media files (images, uploads).
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub wp-media-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      VersioningConfiguration:
+        Status: Enabled
+
+  EFSFileSystem:
+    Description: Shared file storage system for WordPress files across multiple servers.
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+
+  EFSMountTargetA:
+    Description: Connection point for shared storage in first availability zone.
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTargetB:
+    Description: Connection point for shared storage in second availability zone.
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EC2Role:
+    Description: Permissions role allowing WordPress servers to access AWS services.
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  InstanceProfile:
+    Description: Profile that applies permissions role to EC2 instances.
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+
+  # Database System
+
+  DBSubnetGroup:
+    Description: Specifies which subnets the database can use for high availability.
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for WordPress database
+      SubnetIds:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+
+  Database:
+    Description: Managed MySQL/MariaDB database for WordPress data storage.
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub wp-db-${Environment}-${AWS::StackName}
+      DBInstanceClass: db.t3.micro
+      Engine: mariadb
+      EngineVersion: '10.11.8'
+      DBName: wordpress
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'
+      AllocatedStorage: 20
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: true # For development and testing, change to false in production.
+      DeletionProtection: false
+
+
+  # Monitoring & Logging
+
+  WordPressLogGroup:
+    Description: Centralized log storage for troubleshooting WordPress servers.
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/ec2/wordpress-${Environment}
+      RetentionInDays: 7
+
+
+  # WordPress Server Template
+
+  LaunchTemplate:
+    Description: Blueprint defining how to create new WordPress servers.
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-0b83c7f5e2823d1f4
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref InstanceProfile
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        UserData: !Base64
+          Fn::Sub: |
+            #!/bin/bash
+
+            # Redirects all standard output and standard error streams to /var/log/user-data.log for logging purposes.
+            exec > /var/log/user-data.log 2>&1
+            echo "$(date): Starting WordPress setup"
+
+            # Update and install only essential packages
+            dnf update -y
+            dnf install -y docker amazon-efs-utils jq
+            echo "$(date): Essential packages installed"
+
+            # Start Docker
+            systemctl start docker
+            systemctl enable docker
+            echo "$(date): Docker started"
+
+            # Get database credentials (using jq for safe parsing)
+            DB_USERNAME="wpuser"
+            DB_PASSWORD=$(aws secretsmanager get-secret-value --secret-id ${DatabaseSecret} --region ${AWS::Region} --query SecretString --output text | jq -r .password)
+            echo "$(date): Database credentials retrieved safely with jq"
+
+            # Mount EFS
+            mkdir -p /mnt/efs
+            mount -t efs ${EFSFileSystem}:/ /mnt/efs
+            mkdir -p /mnt/efs/wordpress-data
+            echo "$(date): EFS mounted"
+
+            # Start WordPress container
+            echo "$(date): Starting WordPress"
+            docker run -d -p 80:80 \
+              --name wordpress \
+              --restart always \
+              -e WORDPRESS_DB_HOST=${Database.Endpoint.Address} \
+              -e WORDPRESS_DB_USER=$DB_USERNAME \
+              -e WORDPRESS_DB_PASSWORD=$DB_PASSWORD \
+              -e WORDPRESS_DB_NAME=wordpress \
+              -v /mnt/efs/wordpress-data:/var/www/html \
+              wordpress:6.4-apache
+
+            echo "$(date): WordPress container started"
+
+
+  # Load Balancing & Traffic Distribution
+
+  LoadBalancer:
+    Description: Distributes incoming web traffic across multiple EC2 instances.
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+
+  TargetGroup:
+    Description: Defines the group of EC2 instances that receive traffic from the load balancer.
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200,302,301"
+
+  Listener:
+    Description: Load balancer rule that forwards HTTP traffic to EC2 instances.
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+
+  # Auto Scaling & Performance
+
+  AutoScalingGroup:
+    Description: Automatically manages number of EC2 instances based on demand.
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - EFSMountTargetA
+      - EFSMountTargetB
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinInstances
+      MaxSize: !Ref MaxInstances
+      DesiredCapacity: !Ref DesiredInstances
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+
+  ScaleUpPolicy:
+    Description: Policy to add more EC2 instances when CPU usage is high.
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: 300
+
+  ScaleDownPolicy:
+    Description: Policy to remove EC2 instances when CPU usage is low.
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      Cooldown: 300
+
+  CPUAlarmHigh:
+    Description: Triggers scale-up when EC2 instances CPU usage exceeds 60% for 2 minutes.
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale up when CPU > 60% for 2 minutes
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 60
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+
+  CPUAlarmLow:
+    Description: Triggers scale-down when EC2 instances CPU usage below 30% for 5 minutes.
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale down when CPU < 30% for 5 minutes
+      AlarmActions:
+        - !Ref ScaleDownPolicy
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 30
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+
+
+Outputs:
+  WebsiteURL:
+    Description: Main WordPress website URL for visitors
+    Value: !Sub http://${LoadBalancer.DNSName}
+
+  WordPressAdminURL:
+    Description: WordPress admin dashboard URL for site management
+    Value: !Sub http://${LoadBalancer.DNSName}/wp-admin
+
+  LoadBalancerDNS:
+    Description: Load balancer DNS name for custom domain setup
+    Value: !GetAtt LoadBalancer.DNSName
+
+  DatabaseEndpoint:
+    Description: Database server connection address
+    Value: !GetAtt Database.Endpoint.Address
+
+  DatabaseSecretName:
+    Description: AWS Secrets Manager name containing database credentials
+    Value: !Ref DatabaseSecret
+
+  S3BucketName:
+    Description: S3 bucket name for storing WordPress media files
+    Value: !Ref S3Bucket
+
+  S3BucketURL:
+    Description: S3 bucket web URL for media access
+    Value: !Sub https://${S3Bucket}.s3.${AWS::Region}.amazonaws.com
+
+  EFSFileSystemId:
+    Description: Shared file system unique identifier for mounting
+    Value: !Ref EFSFileSystem
+
+  VPCId:
+    Description: Virtual Private Cloud ID for network configuration
+    Value: !Ref VPC
+
+  PublicSubnetIds:
+    Description: List of public subnet IDs for additional resources
+    Value: !Sub "${PublicSubnetA},${PublicSubnetB}"
+
+  CloudWatchLogGroup:
+    Description: Log group name for server troubleshooting
+    Value: !Ref WordPressLogGroup
+
+  LogGroupURL:
+    Description: Direct link to server logs in AWS console
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/${WordPressLogGroup}
