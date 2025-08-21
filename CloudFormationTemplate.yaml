@@ -1,6 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: Complete WordPress hosting infrastructure with load balancer, auto-scaling, database, file storage, and monitoring.
-Author: 84fresva
 
 Parameters:
 
@@ -327,7 +326,22 @@ Resources:
             # Get database credentials (using jq for safe parsing)
             DB_USERNAME="wpuser"
             DB_PASSWORD=$(aws secretsmanager get-secret-value --secret-id ${DatabaseSecret} --region ${AWS::Region} --query SecretString --output text | jq -r .password)
+            DB_HOST="${Database.Endpoint.Address}"
             echo "$(date): Database credentials retrieved safely with jq"
+            echo "$(date): DB_HOST=$DB_HOST, DB_USERNAME=$DB_USERNAME"
+
+            # Test database connectivity before starting WordPress
+            echo "$(date): Testing database connectivity..."
+            dnf install -y mysql -q
+            for i in {1..30}; do
+              if mysql -h "$DB_HOST" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e "SELECT 1;" wordpress 2>/dev/null; then
+                echo "$(date): Database connection successful!"
+                break
+              else
+                echo "$(date): Database connection failed, retrying... ($i/30)"
+                sleep 10
+              fi
+            done
 
             # Mount EFS
             mkdir -p /mnt/efs
@@ -336,18 +350,32 @@ Resources:
             echo "$(date): EFS mounted"
 
             # Start WordPress container
-            echo "$(date): Starting WordPress"
+            echo "$(date): Starting WordPress with verified database connection"
             docker run -d -p 80:80 \
               --name wordpress \
               --restart always \
-              -e WORDPRESS_DB_HOST=${Database.Endpoint.Address} \
-              -e WORDPRESS_DB_USER=$DB_USERNAME \
-              -e WORDPRESS_DB_PASSWORD=$DB_PASSWORD \
+              -e WORDPRESS_DB_HOST="$DB_HOST" \
+              -e WORDPRESS_DB_USER="$DB_USERNAME" \
+              -e WORDPRESS_DB_PASSWORD="$DB_PASSWORD" \
               -e WORDPRESS_DB_NAME=wordpress \
               -v /mnt/efs/wordpress-data:/var/www/html \
               wordpress:6.4-apache
 
             echo "$(date): WordPress container started"
+
+            # Wait for WordPress to be ready
+            echo "$(date): Waiting for WordPress to respond..."
+            for i in {1..30}; do
+              http_status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/ 2>/dev/null)
+              if [ "$http_status" = "200" ] || [ "$http_status" = "302" ]; then
+                echo "$(date): WordPress is ready! HTTP status: $http_status"
+                break
+              fi
+              echo "$(date): WordPress not ready yet (HTTP: $http_status), waiting... ($i/30)"
+              sleep 10
+            done
+
+            echo "$(date): Setup completed - instance ready for traffic"
 
 
   # Load Balancing & Traffic Distribution
@@ -373,7 +401,7 @@ Resources:
       VpcId: !Ref VPC
       HealthCheckPath: /
       HealthCheckIntervalSeconds: 30
-      HealthCheckTimeoutSeconds: 10
+      HealthCheckTimeoutSeconds: 25
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 3
       Matcher:
@@ -412,7 +440,7 @@ Resources:
       TargetGroupARNs:
         - !Ref TargetGroup
       HealthCheckType: ELB
-      HealthCheckGracePeriod: 300
+      HealthCheckGracePeriod: 900
 
   ScaleUpPolicy:
     Description: Policy to add more EC2 instances when CPU usage is high.
