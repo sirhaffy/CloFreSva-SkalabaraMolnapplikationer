@@ -1,5 +1,6 @@
-# School Project - Campus Mölndal - Cloud Developer
-> Course - Skalbara molnapplikationer / Scalable Cloud Applications.
+# School Project
+> School: Campus Mölndal  
+> Course: Cloud Developer - Scalable Cloud Applications
 
 ## Content
 Cloud Formations on AWS and AWS infrastructure.
