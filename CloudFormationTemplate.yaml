@@ -372,6 +372,7 @@ Resources:
 
             # Redirects all standard output and standard error streams to /var/log/user-data.log for logging purposes.
             exec > /var/log/user-data.log 2>&1
+
             echo "$(date): Starting WordPress setup"
 
             # Update and install only essential packages
