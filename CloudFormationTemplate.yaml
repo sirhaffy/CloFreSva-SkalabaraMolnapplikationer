@@ -1,5 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Complete WordPress hosting infrastructure with load balancer, auto-scaling, database, file storage, and monitoring.
+Description: Complete WordPress hosting infrastructure with load balancer,
+  auto-scaling, database, file storage, monitoring and more.
 
 Parameters:
 
@@ -16,8 +17,8 @@ Parameters:
   MinInstances:
     Description: Minimum number of EC2 instances to keep running.
     Type: Number
-    Default: 1
-    MinValue: 1
+    Default: 2
+    MinValue: 2
 
   MaxInstances:
     Description: Maximum number of EC2 instances during high traffic.
@@ -29,9 +30,8 @@ Parameters:
     Description: Normal number of EC2 instances to run.
     Type: Number
     Default: 2
-    MinValue: 1
+    MinValue: 2
     MaxValue: 10
-
 
 Resources:
 
@@ -44,12 +44,11 @@ Resources:
       Name: !Sub wordpress-db-secret-${Environment}-${AWS::StackName}
       GenerateSecretString:
         SecretStringTemplate: '{"username": "wpuser"}'
-        GenerateStringKey: 'password'
+        GenerateStringKey: password
         PasswordLength: 20
         ExcludeCharacters: '"@/\^`~(){}[]|;:,.<>?*&#%$!'
         RequireEachIncludedType: true
         IncludeSpace: false
-
 
   # Network & Connectivity
 
@@ -104,7 +103,9 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: 10.0.1.0/24
       MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select [0, !GetAZs '']
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
       Tags:
         - Key: Name
           Value: !Sub wp-subnet-a-${Environment}
@@ -116,10 +117,80 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: 10.0.2.0/24
       MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select [1, !GetAZs '']
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
       Tags:
         - Key: Name
           Value: !Sub wp-subnet-b-${Environment}
+
+  NatGateway:
+    Description: NAT Gateway for outbound internet access in PublicSubnetA (with dynamic IP)
+    Type: AWS::EC2::NatGateway
+    Properties:
+      ConnectivityType: public
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub nat-gateway-${Environment}
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub wp-private-rt-${Environment}
+
+  PrivateRoute:
+    Description: Route to Internet via NAT Gateway
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetA:
+    Description: First private subnet for backend resources (EC2, RDS, EFS).
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: !Sub wp-private-subnet-a-${Environment}
+
+  PrivateSubnetB:
+    Description: Second private subnet for backend resources (EC2, RDS, EFS).
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: !Sub wp-private-subnet-b-${Environment}
+
+  PrivateSubnetAssociationA:
+    Description: Connects first private subnet to routing table.
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetAssociationB:
+    Description: Connects second private subnet to routing table.
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
 
   SubnetAssociationA:
     Description: Connects first subnet to routing table.
@@ -134,7 +205,6 @@ Resources:
     Properties:
       SubnetId: !Ref PublicSubnetB
       RouteTableId: !Ref RouteTable
-
 
   # Firewall Rules
 
@@ -178,17 +248,13 @@ Resources:
     Description: Firewall rules allowing WordPress servers to access database.
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow MySQL traffic from EC2
+      GroupDescription: Allow MySQL traffic from EC2 only
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 3306
           ToPort: 3306
           SourceSecurityGroupId: !Ref EC2SecurityGroup
-        - IpProtocol: tcp
-          FromPort: 3306
-          ToPort: 3306
-          CidrIp: 0.0.0.0/0
 
   S3Bucket:
     Description: Cloud storage bucket for WordPress media files (images, uploads).
@@ -196,10 +262,10 @@ Resources:
     Properties:
       BucketName: !Sub wp-media-${AWS::AccountId}-${AWS::Region}
       PublicAccessBlockConfiguration:
-        BlockPublicAcls: false
-        BlockPublicPolicy: false
-        IgnorePublicAcls: false
-        RestrictPublicBuckets: false
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
       VersioningConfiguration:
         Status: Enabled
 
@@ -211,20 +277,18 @@ Resources:
       PerformanceMode: generalPurpose
 
   EFSMountTargetA:
-    Description: Connection point for shared storage in first availability zone.
     Type: AWS::EFS::MountTarget
     Properties:
       FileSystemId: !Ref EFSFileSystem
-      SubnetId: !Ref PublicSubnetA
+      SubnetId: !Ref PrivateSubnetA
       SecurityGroups:
         - !Ref EFSSecurityGroup
 
   EFSMountTargetB:
-    Description: Connection point for shared storage in second availability zone.
     Type: AWS::EFS::MountTarget
     Properties:
       FileSystemId: !Ref EFSFileSystem
-      SubnetId: !Ref PublicSubnetB
+      SubnetId: !Ref PrivateSubnetB
       SecurityGroups:
         - !Ref EFSSecurityGroup
 
@@ -251,7 +315,6 @@ Resources:
       Roles:
         - !Ref EC2Role
 
-
   # Database System
 
   DBSubnetGroup:
@@ -260,8 +323,8 @@ Resources:
     Properties:
       DBSubnetGroupDescription: Subnet group for WordPress database
       SubnetIds:
-        - !Ref PublicSubnetA
-        - !Ref PublicSubnetB
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
 
   Database:
     Description: Managed MySQL/MariaDB database for WordPress data storage.
@@ -270,7 +333,7 @@ Resources:
       DBInstanceIdentifier: !Sub wp-db-${Environment}-${AWS::StackName}
       DBInstanceClass: db.t3.micro
       Engine: mariadb
-      EngineVersion: '10.11.8'
+      EngineVersion: 10.11.8
       DBName: wordpress
       MasterUsername: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}'
       MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'
@@ -278,9 +341,8 @@ Resources:
       VPCSecurityGroups:
         - !Ref RDSSecurityGroup
       DBSubnetGroupName: !Ref DBSubnetGroup
-      PubliclyAccessible: true # For development and testing, change to false in production.
+      PubliclyAccessible: false
       DeletionProtection: false
-
 
   # Monitoring & Logging
 
@@ -290,7 +352,6 @@ Resources:
     Properties:
       LogGroupName: !Sub /aws/ec2/wordpress-${Environment}
       RetentionInDays: 7
-
 
   # WordPress Server Template
 
@@ -330,16 +391,15 @@ Resources:
             echo "$(date): Database credentials retrieved safely with jq"
             echo "$(date): DB_HOST=$DB_HOST, DB_USERNAME=$DB_USERNAME"
 
-            # Test database connectivity before starting WordPress
-            echo "$(date): Testing database connectivity..."
-            dnf install -y mysql -q
-            for i in {1..30}; do
-              if mysql -h "$DB_HOST" -u "$DB_USERNAME" -p"$DB_PASSWORD" -e "SELECT 1;" wordpress 2>/dev/null; then
-                echo "$(date): Database connection successful!"
+            # Test database connectivity before starting WordPress (simplified)
+            echo "$(date): Testing basic database connectivity..."
+            for i in {1..10}; do
+              if nc -z "$DB_HOST" 3306; then
+                echo "$(date): Database port 3306 is reachable!"
                 break
               else
-                echo "$(date): Database connection failed, retrying... ($i/30)"
-                sleep 10
+                echo "$(date): Database port not reachable, retrying... ($i/10)"
+                sleep 5
               fi
             done
 
@@ -377,7 +437,6 @@ Resources:
 
             echo "$(date): Setup completed - instance ready for traffic"
 
-
   # Load Balancing & Traffic Distribution
 
   LoadBalancer:
@@ -393,7 +452,8 @@ Resources:
         - !Ref PublicSubnetB
 
   TargetGroup:
-    Description: Defines the group of EC2 instances that receive traffic from the load balancer.
+    Description: Defines the group of EC2 instances that receive traffic from the
+      load balancer.
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
       Port: 80
@@ -405,7 +465,7 @@ Resources:
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 3
       Matcher:
-        HttpCode: "200,302,301"
+        HttpCode: 200,302,301,404
 
   Listener:
     Description: Load balancer rule that forwards HTTP traffic to EC2 instances.
@@ -418,7 +478,6 @@ Resources:
       Port: 80
       Protocol: HTTP
 
-
   # Auto Scaling & Performance
 
   AutoScalingGroup:
@@ -427,6 +486,7 @@ Resources:
     DependsOn:
       - EFSMountTargetA
       - EFSMountTargetB
+      - Database # Depends on, waits on it to be done..
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref LaunchTemplate
@@ -435,12 +495,24 @@ Resources:
       MaxSize: !Ref MaxInstances
       DesiredCapacity: !Ref DesiredInstances
       VPCZoneIdentifier:
-        - !Ref PublicSubnetA
-        - !Ref PublicSubnetB
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
       TargetGroupARNs:
         - !Ref TargetGroup
       HealthCheckType: ELB
-      HealthCheckGracePeriod: 900
+      HealthCheckGracePeriod: 480
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
 
   ScaleUpPolicy:
     Description: Policy to add more EC2 instances when CPU usage is high.
@@ -450,7 +522,7 @@ Resources:
       PolicyType: SimpleScaling
       AdjustmentType: ChangeInCapacity
       ScalingAdjustment: 1
-      Cooldown: 300
+      Cooldown: 180
 
   ScaleDownPolicy:
     Description: Policy to remove EC2 instances when CPU usage is low.
@@ -463,10 +535,10 @@ Resources:
       Cooldown: 300
 
   CPUAlarmHigh:
-    Description: Triggers scale-up when EC2 instances CPU usage exceeds 60% for 2 minutes.
+    Description: Triggers scale-up when EC2 instances CPU usage exceeds 40% for 2 minutes.
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmDescription: Scale up when CPU > 60% for 2 minutes
+      AlarmDescription: Scale up when CPU > 40% for 2 minutes
       AlarmActions:
         - !Ref ScaleUpPolicy
       MetricName: CPUUtilization
@@ -474,7 +546,7 @@ Resources:
       Statistic: Average
       Period: 60
       EvaluationPeriods: 2
-      Threshold: 60
+      Threshold: 40
       ComparisonOperator: GreaterThanThreshold
       Dimensions:
         - Name: AutoScalingGroupName
@@ -497,7 +569,6 @@ Resources:
       Dimensions:
         - Name: AutoScalingGroupName
           Value: !Ref AutoScalingGroup
-
 
 Outputs:
   WebsiteURL:
@@ -538,7 +609,7 @@ Outputs:
 
   PublicSubnetIds:
     Description: List of public subnet IDs for additional resources
-    Value: !Sub "${PublicSubnetA},${PublicSubnetB}"
+    Value: !Sub ${PublicSubnetA},${PublicSubnetB}
 
   CloudWatchLogGroup:
     Description: Log group name for server troubleshooting
