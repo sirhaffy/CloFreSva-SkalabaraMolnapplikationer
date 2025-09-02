@@ -1,6 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Complete WordPress hosting infrastructure with load balancer,
-  auto-scaling, database, file storage, monitoring and more.
+Description: Complete WordPress hosting infrastructure with load balancer, auto-scaling, database, file storage and monitoring.
 
 Parameters:
 
@@ -33,6 +32,7 @@ Parameters:
     MinValue: 2
     MaxValue: 10
 
+
 Resources:
 
   # Security & Secrets
@@ -44,11 +44,12 @@ Resources:
       Name: !Sub wordpress-db-secret-${Environment}-${AWS::StackName}
       GenerateSecretString:
         SecretStringTemplate: '{"username": "wpuser"}'
-        GenerateStringKey: password
+        GenerateStringKey: 'password'
         PasswordLength: 20
         ExcludeCharacters: '"@/\^`~(){}[]|;:,.<>?*&#%$!'
         RequireEachIncludedType: true
         IncludeSpace: false
+
 
   # Network & Connectivity
 
@@ -103,9 +104,7 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: 10.0.1.0/24
       MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select
-        - 0
-        - !GetAZs ''
+      AvailabilityZone: !Select [0, !GetAZs '']
       Tags:
         - Key: Name
           Value: !Sub wp-subnet-a-${Environment}
@@ -117,23 +116,28 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: 10.0.2.0/24
       MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select
-        - 1
-        - !GetAZs ''
+      AvailabilityZone: !Select [1, !GetAZs '']
       Tags:
         - Key: Name
           Value: !Sub wp-subnet-b-${Environment}
 
+  NatGatewayEIP:
+    Description: Elastic IP for NAT Gateway for outbound internet access
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
   NatGateway:
-    Description: NAT Gateway for outbound internet access in PublicSubnetA (with dynamic IP)
+    Description: NAT Gateway for outbound internet access in PublicSubnetA
     Type: AWS::EC2::NatGateway
     Properties:
-      ConnectivityType: public
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
       SubnetId: !Ref PublicSubnetA
       Tags:
         - Key: Name
           Value: !Sub nat-gateway-${Environment}
 
+  # Private Route Table
   PrivateRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -142,14 +146,15 @@ Resources:
         - Key: Name
           Value: !Sub wp-private-rt-${Environment}
 
+  # Route to Internet via NAT Gateway
   PrivateRoute:
-    Description: Route to Internet via NAT Gateway
     Type: AWS::EC2::Route
     Properties:
       RouteTableId: !Ref PrivateRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !Ref NatGateway
 
+  # Private Subnet A
   PrivateSubnetA:
     Description: First private subnet for backend resources (EC2, RDS, EFS).
     Type: AWS::EC2::Subnet
@@ -157,13 +162,12 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: 10.0.3.0/24
       MapPublicIpOnLaunch: false
-      AvailabilityZone: !Select
-        - 0
-        - !GetAZs ''
+      AvailabilityZone: !Select [0, !GetAZs '']
       Tags:
         - Key: Name
           Value: !Sub wp-private-subnet-a-${Environment}
 
+  # Private Subnet B
   PrivateSubnetB:
     Description: Second private subnet for backend resources (EC2, RDS, EFS).
     Type: AWS::EC2::Subnet
@@ -171,22 +175,20 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: 10.0.4.0/24
       MapPublicIpOnLaunch: false
-      AvailabilityZone: !Select
-        - 1
-        - !GetAZs ''
+      AvailabilityZone: !Select [1, !GetAZs '']
       Tags:
         - Key: Name
           Value: !Sub wp-private-subnet-b-${Environment}
 
+  # Associate Private Subnet A with Private Route Table
   PrivateSubnetAssociationA:
-    Description: Connects first private subnet to routing table.
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnetA
       RouteTableId: !Ref PrivateRouteTable
 
+  # Associate Private Subnet B with Private Route Table
   PrivateSubnetAssociationB:
-    Description: Connects second private subnet to routing table.
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnetB
@@ -205,6 +207,7 @@ Resources:
     Properties:
       SubnetId: !Ref PublicSubnetB
       RouteTableId: !Ref RouteTable
+
 
   # Firewall Rules
 
@@ -255,6 +258,7 @@ Resources:
           FromPort: 3306
           ToPort: 3306
           SourceSecurityGroupId: !Ref EC2SecurityGroup
+
 
   S3Bucket:
     Description: Cloud storage bucket for WordPress media files (images, uploads).
@@ -315,6 +319,7 @@ Resources:
       Roles:
         - !Ref EC2Role
 
+
   # Database System
 
   DBSubnetGroup:
@@ -333,7 +338,7 @@ Resources:
       DBInstanceIdentifier: !Sub wp-db-${Environment}-${AWS::StackName}
       DBInstanceClass: db.t3.micro
       Engine: mariadb
-      EngineVersion: 10.11.8
+      EngineVersion: '10.11.8'
       DBName: wordpress
       MasterUsername: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}'
       MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'
@@ -341,8 +346,9 @@ Resources:
       VPCSecurityGroups:
         - !Ref RDSSecurityGroup
       DBSubnetGroupName: !Ref DBSubnetGroup
-      PubliclyAccessible: false
+      PubliclyAccessible: true # For development and testing, change to false in production.
       DeletionProtection: false
+
 
   # Monitoring & Logging
 
@@ -352,6 +358,7 @@ Resources:
     Properties:
       LogGroupName: !Sub /aws/ec2/wordpress-${Environment}
       RetentionInDays: 7
+
 
   # WordPress Server Template
 
@@ -372,7 +379,6 @@ Resources:
 
             # Redirects all standard output and standard error streams to /var/log/user-data.log for logging purposes.
             exec > /var/log/user-data.log 2>&1
-
             echo "$(date): Starting WordPress setup"
 
             # Update and install only essential packages
@@ -438,6 +444,7 @@ Resources:
 
             echo "$(date): Setup completed - instance ready for traffic"
 
+
   # Load Balancing & Traffic Distribution
 
   LoadBalancer:
@@ -453,8 +460,7 @@ Resources:
         - !Ref PublicSubnetB
 
   TargetGroup:
-    Description: Defines the group of EC2 instances that receive traffic from the
-      load balancer.
+    Description: Defines the group of EC2 instances that receive traffic from the load balancer.
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
       Port: 80
@@ -462,11 +468,11 @@ Resources:
       VpcId: !Ref VPC
       HealthCheckPath: /
       HealthCheckIntervalSeconds: 30
-      HealthCheckTimeoutSeconds: 25
+      HealthCheckTimeoutSeconds: 30
       HealthyThresholdCount: 2
       UnhealthyThresholdCount: 3
       Matcher:
-        HttpCode: 200,302,301,404
+        HttpCode: "200,302,301,404"
 
   Listener:
     Description: Load balancer rule that forwards HTTP traffic to EC2 instances.
@@ -479,6 +485,7 @@ Resources:
       Port: 80
       Protocol: HTTP
 
+
   # Auto Scaling & Performance
 
   AutoScalingGroup:
@@ -487,7 +494,7 @@ Resources:
     DependsOn:
       - EFSMountTargetA
       - EFSMountTargetB
-      - Database
+      - Database # Depends on, waits on it to be done..
     Properties:
       LaunchTemplate:
         LaunchTemplateId: !Ref LaunchTemplate
@@ -504,7 +511,6 @@ Resources:
       HealthCheckGracePeriod: 480
     UpdatePolicy:
       AutoScalingRollingUpdate:
-        Description: Switches out old instances for new ones during updates.
         MinInstancesInService: 1
         MaxBatchSize: 1
         PauseTime: PT5M
@@ -572,6 +578,7 @@ Resources:
         - Name: AutoScalingGroupName
           Value: !Ref AutoScalingGroup
 
+
 Outputs:
   WebsiteURL:
     Description: Main WordPress website URL for visitors
@@ -611,7 +618,7 @@ Outputs:
 
   PublicSubnetIds:
     Description: List of public subnet IDs for additional resources
-    Value: !Sub ${PublicSubnetA},${PublicSubnetB}
+    Value: !Sub "${PublicSubnetA},${PublicSubnetB}"
 
   CloudWatchLogGroup:
     Description: Log group name for server troubleshooting
